@@ -1,0 +1,103 @@
+name: Sync SNL Batting Statistics
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/sync-stats.yml"
+      - "scripts/**"
+      - "index.html"
+      - "stats.html"
+  schedule:
+    # Checks OneDrive every two hours. No manual GitHub updates needed.
+    - cron: '17 */2 * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: snl-stats-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out Stats Hub
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install OneDrive dependencies
+        run: python -m pip install msal requests
+
+      - name: Download ALL SNL season reports from OneDrive
+        env:
+          MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+          MSAL_CACHE: ${{ secrets.MSAL_CACHE }}
+        run: python scripts/download_stats.py
+
+      - name: Generate season batting statistics
+        run: |
+          python scripts/generate_stats_data.py \
+            --input-dir stats-input \
+            --audit-output stats-audit.json \
+            --output public/stats-data.json \
+            --publish \
+            --confirm-export-scope \
+            --confirm-publication-rights
+
+      - name: Limit data to approved public batting fields
+        run: python scripts/prepare_public_stats.py
+
+      - name: Add Stats Hub website pages
+        run: |
+          cp index.html public/index.html
+          cp stats.html public/stats.html
+          touch public/.nojekyll
+
+      - name: Check public website files
+        run: |
+          python - <<'PY_CHECK'
+          from pathlib import Path
+          import json
+          directory = Path('public')
+          for name in ('index.html', 'stats.html', 'stats-data.json'):
+              if not (directory / name).is_file():
+                  raise RuntimeError('Missing website file: ' + name)
+          data = json.loads((directory/'stats-data.json').read_text(encoding='utf-8'))
+          if not data.get('seasons'):
+              raise RuntimeError('No season data generated')
+          if data.get('current_season') not in {s['season_id'] for s in data['seasons']}:
+              raise RuntimeError('Current season identifier is invalid')
+          for season in data['seasons']:
+              if len(season['teams']) != 6:
+                  raise RuntimeError('Expected six teams per season')
+              if 'players' not in season:
+                  raise RuntimeError('Player records missing')
+              for p in season['players']:
+                  if set(p) != {'name','team','team_id','stats'}:
+                      raise RuntimeError('Unexpected public player fields')
+          print('Stats Hub verified:', len(data['seasons']), 'season(s)')
+          PY_CHECK
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Stats Hub website
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Publish Stats Hub
+        id: deployment
+        uses: actions/deploy-pages@v4
